@@ -2,7 +2,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.decomposition import PCA
@@ -11,6 +11,9 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
 from imblearn.over_sampling import SMOTE
+import optuna
+import joblib
+from scipy.stats import zscore
 
 # Set random seed for reproducibility
 torch.manual_seed(42)
@@ -27,12 +30,10 @@ boolean_cols = ['feature_3', 'feature_4', 'feature_5', 'feature_6', 'feature_7',
                 'feature_8', 'feature_9', 'feature_11', 'feature_12']
 
 # Handle missing values
-# Impute job_state with most frequent value
 state_imputer = SimpleImputer(strategy='most_frequent')
 train_df['job_state'] = state_imputer.fit_transform(train_df[['job_state']]).flatten()
 test_df['job_state'] = state_imputer.transform(test_df[['job_state']]).flatten()
 
-# Impute feature_10 with median
 feature10_imputer = SimpleImputer(strategy='median')
 train_df['feature_10'] = feature10_imputer.fit_transform(train_df[['feature_10']]).flatten()
 test_df['feature_10'] = feature10_imputer.transform(test_df[['feature_10']]).flatten()
@@ -66,22 +67,26 @@ train_df[['job_posted_year', 'job_posted_month']] = year_imputer.fit_transform(t
 test_df[['job_posted_year', 'job_posted_month']] = year_imputer.transform(test_df[['job_posted_year', 'job_posted_month']])
 
 # Additional feature engineering
-# Interaction feature
 train_df['feature_2_times_10'] = train_df['feature_2'] * train_df['feature_10']
 test_df['feature_2_times_10'] = test_df['feature_2'] * test_df['feature_10']
 numerical_cols.append('feature_2_times_10')
 
-# Polynomial features
 train_df['feature_2_squared'] = train_df['feature_2'] ** 2
 test_df['feature_2_squared'] = test_df['feature_2'] ** 2
 train_df['feature_10_squared'] = train_df['feature_10'] ** 2
 test_df['feature_10_squared'] = test_df['feature_10'] ** 2
 numerical_cols.extend(['feature_2_squared', 'feature_10_squared'])
 
-# Categorical interaction
 train_df['title_state_interaction'] = train_df['job_title'].astype(str) + '_' + train_df['job_state'].astype(str)
 test_df['title_state_interaction'] = test_df['job_title'].astype(str) + '_' + test_df['job_state'].astype(str)
 categorical_cols.append('title_state_interaction')
+
+# Remove outliers from train_df based on numerical columns (before scaling/PCA)
+numerical_for_outlier = [col for col in numerical_cols if col in train_df.columns]
+z_scores = np.abs(zscore(train_df[numerical_for_outlier], nan_policy='omit'))
+outlier_threshold = 3
+outlier_mask = (z_scores < outlier_threshold).all(axis=1)
+train_df = train_df[outlier_mask].reset_index(drop=True)
 
 # Encode categorical variables
 label_encoders = {}
@@ -105,15 +110,13 @@ test_df[numerical_cols] = scaler.transform(test_df[numerical_cols])
 
 # Dimensionality reduction with PCA on job_desc_* columns
 job_desc_cols = [f'job_desc_{i:03d}' for i in range(1, 301)]
-pca = PCA(n_components=150)  # Increased components
+pca = PCA(n_components=300)
 train_job_desc_pca = pca.fit_transform(train_df[job_desc_cols])
 test_job_desc_pca = pca.transform(test_df[job_desc_cols])
 
-# Create DataFrames for PCA components
-train_pca_df = pd.DataFrame(train_job_desc_pca, columns=[f'job_desc_pca_{i+1}' for i in range(150)], index=train_df.index)
-test_pca_df = pd.DataFrame(test_job_desc_pca, columns=[f'job_desc_pca_{i+1}' for i in range(150)], index=test_df.index)
+train_pca_df = pd.DataFrame(train_job_desc_pca, columns=[f'job_desc_pca_{i+1}' for i in range(300)], index=train_df.index)
+test_pca_df = pd.DataFrame(test_job_desc_pca, columns=[f'job_desc_pca_{i+1}' for i in range(300)], index=test_df.index)
 
-# Concatenate PCA components to avoid fragmentation
 train_df = pd.concat([train_df.drop(columns=job_desc_cols), train_pca_df], axis=1)
 test_df = pd.concat([test_df.drop(columns=job_desc_cols), test_pca_df], axis=1)
 
@@ -134,8 +137,7 @@ X_resampled, y_resampled = smote.fit_resample(X, y)
 X_train, X_temp, y_train, y_temp = train_test_split(X_resampled, y_resampled, test_size=0.3, random_state=42, stratify=y_resampled)
 X_val, X_test_internal, y_val, y_test_internal = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
 
-
-# Custom Dataset class (unchanged)
+# Custom Dataset class
 class SalaryDataset(Dataset):
     def __init__(self, X, y=None):
         self.X = torch.tensor(X.values, dtype=torch.float32)
@@ -149,7 +151,7 @@ class SalaryDataset(Dataset):
             return self.X[idx], self.y[idx]
         return self.X[idx]
 
-# Define the neural network (unchanged)
+# Neural network
 class SalaryClassifier(nn.Module):
     def __init__(self, input_size, hidden_size=1024, num_classes=3, dropout_rate=0.2):
         super(SalaryClassifier, self).__init__()
@@ -217,10 +219,11 @@ class SalaryClassifier(nn.Module):
         x6 = self.layer6(x5)
         return x6
 
-# Corrected PyTorchClassifier wrapper
+# PyTorchClassifier wrapper
 class PyTorchClassifier(BaseEstimator, ClassifierMixin):
     def __init__(self, input_size, hidden_size=1024, num_classes=3, dropout_rate=0.2, 
-                 learning_rate=0.00003, batch_size=128, num_epochs=50, weight_decay=1e-4):
+                 learning_rate=0.00003, batch_size=128, num_epochs=50, weight_decay=1e-4,
+                 early_stopping_rounds=10, early_stopping_delta=0.0):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_classes = num_classes
@@ -229,31 +232,29 @@ class PyTorchClassifier(BaseEstimator, ClassifierMixin):
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.weight_decay = weight_decay
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.early_stopping_rounds = early_stopping_rounds
+        self.early_stopping_delta = early_stopping_delta
+        self.device = torch.device('cpu')
         self.model = None
-        self.classes_ = None  # Initialize classes_ attribute
+        self.classes_ = None
     
     def fit(self, X, y):
-        # Store class labels
         self.classes_ = np.unique(y)
-        
-        # Initialize model
         self.model = SalaryClassifier(
             input_size=self.input_size, 
             hidden_size=self.hidden_size, 
             num_classes=self.num_classes, 
             dropout_rate=self.dropout_rate
         ).to(self.device)
-        
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-        
-        # Create DataLoader
         dataset = SalaryDataset(pd.DataFrame(X), pd.Series(y))
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-        
-        # Training loop
+        best_loss = float('inf')
+        best_state = None
+        epochs_no_improve = 0
+
         self.model.train()
         for epoch in range(self.num_epochs):
             epoch_loss = 0
@@ -263,13 +264,21 @@ class PyTorchClassifier(BaseEstimator, ClassifierMixin):
                 outputs = self.model(X_batch)
                 loss = criterion(outputs, y_batch)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)  # Corrected
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
                 epoch_loss += loss.item()
-            
             epoch_loss /= len(dataloader)
             scheduler.step(epoch_loss)
-        
+            if epoch_loss + self.early_stopping_delta < best_loss:
+                best_loss = epoch_loss
+                best_state = self.model.state_dict()
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= self.early_stopping_rounds:
+                    if best_state is not None:
+                        self.model.load_state_dict(best_state)
+                    break
         return self
     
     def predict(self, X):
@@ -277,14 +286,12 @@ class PyTorchClassifier(BaseEstimator, ClassifierMixin):
         predictions = []
         dataset = SalaryDataset(pd.DataFrame(X))
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
-        
         with torch.no_grad():
             for X_batch in dataloader:
                 X_batch = X_batch.to(self.device)
                 outputs = self.model(X_batch)
                 _, predicted = torch.max(outputs.data, 1)
                 predictions.extend(predicted.cpu().numpy())
-        
         return np.array(predictions)
     
     def predict_proba(self, X):
@@ -292,51 +299,71 @@ class PyTorchClassifier(BaseEstimator, ClassifierMixin):
         probabilities = []
         dataset = SalaryDataset(pd.DataFrame(X))
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
-        
         with torch.no_grad():
             for X_batch in dataloader:
                 X_batch = X_batch.to(self.device)
                 outputs = self.model(X_batch)
                 probs = torch.softmax(outputs, dim=1)
                 probabilities.extend(probs.cpu().numpy())
-        
         return np.array(probabilities)
 
-# Define hyperparameter grid
-param_grid = {
-    'hidden_size': [512, 1024],
-    'dropout_rate': [0.2, 0.3],
-    'learning_rate': [0.00003, 0.0001],
-    'batch_size': [64, 128]
-}
+# Optuna hyperparameter search
+def objective(trial):
+    hidden_size = trial.suggest_categorical('hidden_size', [256, 384, 512, 640, 768, 896, 1024, 1280, 1536])
+    dropout_rate = trial.suggest_float('dropout_rate', 0.05, 0.5, step=0.05)
+    learning_rate = trial.suggest_loguniform('learning_rate', 1e-5, 3e-3)
+    batch_size = trial.suggest_categorical('batch_size', [16, 32, 48, 64, 96, 128, 192, 256])
 
-# Initialize the PyTorch classifier
-base_model = PyTorchClassifier(
-    input_size=X.shape[1], 
-    num_classes=len(target_encoder.classes_), 
-    num_epochs=50
+    model = PyTorchClassifier(
+        input_size=X.shape[1],
+        num_classes=len(target_encoder.classes_),
+        hidden_size=hidden_size,
+        dropout_rate=dropout_rate,
+        learning_rate=learning_rate,
+        batch_size=batch_size,
+        num_epochs=1000,
+        early_stopping_rounds=15,
+        early_stopping_delta=0.0
+    )
+    model.fit(X_train, y_train)
+    val_preds = model.predict(X_val)
+    accuracy = (val_preds == y_val).mean()
+
+    # Save best model so far
+    if not hasattr(objective, "best_accuracy"):
+        objective.best_accuracy = 0
+    if accuracy > objective.best_accuracy:
+        objective.best_accuracy = accuracy
+        torch.save(model.model.state_dict(), f"best_salary_model_{accuracy:.4f}.pt")
+        joblib.dump(model, f"best_sklearn_wrapper_{accuracy:.4f}.joblib")
+        joblib.dump(trial.params, f"best_trial_params_{accuracy:.4f}.joblib")
+        print(f"New best model saved with accuracy: {accuracy:.4f}")
+
+    return accuracy
+
+study = optuna.create_study(direction='maximize')
+study.optimize(objective, n_trials=100, show_progress_bar=True)
+
+print("Best trial:")
+trial = study.best_trial
+print(f"  Value: {trial.value}")
+print("  Params: ")
+for key, value in trial.params.items():
+    print(f"    {key}: {value}")
+
+# Train best model on full resampled data
+best_params = trial.params
+best_model = PyTorchClassifier(
+    input_size=X.shape[1],
+    num_classes=len(target_encoder.classes_),
+    hidden_size=best_params['hidden_size'],
+    dropout_rate=best_params['dropout_rate'],
+    learning_rate=best_params['learning_rate'],
+    batch_size=best_params['batch_size'],
+    num_epochs=1000,
+    early_stopping_rounds=15,
+    early_stopping_delta=0.0
 )
-
-# Perform grid search
-grid_search = GridSearchCV(
-    estimator=base_model,
-    param_grid=param_grid,
-    cv=3,
-    scoring='accuracy',
-    n_jobs=1,
-    verbose=2,
-    error_score='raise'
-)
-
-# Fit grid search
-grid_search.fit(X_resampled, y_resampled)
-
-# Print best parameters and score
-print("Best parameters:", grid_search.best_params_)
-print("Best cross-validation accuracy:", grid_search.best_score_)
-
-# Train the best model on full training data
-best_model = grid_search.best_estimator_
 best_model.fit(X_resampled, y_resampled)
 
 # Evaluate on internal test set
@@ -354,8 +381,22 @@ submission = pd.DataFrame({
     'salary_category': predictions
 })
 
-# Save submission
-submission.to_csv('submission_grid_search.csv', index=False)
-
-# Display first few predictions
+submission.to_csv('submission_optuna.csv', index=False)
 print(submission.head())
+
+# Save best model weights (PyTorch)
+torch.save(best_model.model.state_dict(), "best_salary_model.pt")
+
+# Save Optuna study
+joblib.dump(study, "optuna_study.joblib")
+
+# Save best model hyperparameters and sklearn wrapper (for inference pipeline)
+joblib.dump(best_model, "best_sklearn_wrapper.joblib")
+
+# Save encoders, scaler, PCA, and other preprocessing objects
+joblib.dump(label_encoders, "label_encoders.joblib")
+joblib.dump(target_encoder, "target_encoder.joblib")
+joblib.dump(scaler, "scaler.joblib")
+joblib.dump(pca, "pca.joblib")
+
+print("Artifacts saved: best_salary_model.pt, optuna_study.joblib, best_sklearn_wrapper.joblib, label_encoders.joblib, target_encoder.joblib, scaler.joblib, pca.joblib")
